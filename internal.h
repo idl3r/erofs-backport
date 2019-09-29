@@ -16,6 +16,7 @@
 #include <linux/magic.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
+#include <backport/base.h>
 #include "erofs_fs.h"
 
 /* redefine pr_fmt "erofs: " */
@@ -57,6 +58,7 @@ struct erofs_sb_info {
 
 	/* the dedicated workstation for compression */
 	struct radix_tree_root workstn_tree;
+	struct mutex workstn_tree_lock;
 
 	/* threshold for decompression synchronously */
 	unsigned int max_sync_decompress_pages;
@@ -429,6 +431,8 @@ static inline void z_erofs_exit_zip_subsystem(void) {}
 #endif	/* !CONFIG_EROFS_FS_ZIP */
 
 #define EFSCORRUPTED    EUCLEAN         /* Filesystem is corrupted */
+
+// #include "xarray.h"
 
 #endif	/* __EROFS_INTERNAL_H */
 

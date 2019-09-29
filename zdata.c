@@ -714,7 +714,8 @@ static inline void z_erofs_vle_read_endio(struct bio *bio)
 {
 	int i;
 	struct erofs_sb_info *sbi = NULL;
-	blk_status_t err = bio->bi_status;
+	// blk_status_t err = bio->bi_status;
+	int err = bio->bi_error;
 	struct bio_vec *bvec;
 	/* struct bvec_iter_all iter_all; */
 
@@ -1120,7 +1121,7 @@ static struct z_erofs_unzip_io *jobqueue_init(struct super_block *sb,
 		goto out;
 	}
 
-	iosb = kvzalloc(sizeof(*iosb), GFP_KERNEL | __GFP_NOFAIL);
+	iosb = kzalloc(sizeof(*iosb), GFP_KERNEL | __GFP_NOFAIL);
 	DBG_BUGON(!iosb);
 
 	/* initialize fields in the allocated descriptor */
@@ -1262,7 +1263,8 @@ submit_bio_retry:
 			bio = bio_alloc(GFP_NOIO, BIO_MAX_PAGES);
 
 			bio->bi_end_io = z_erofs_vle_read_endio;
-			bio_set_dev(bio, sb->s_bdev);
+			// bio_set_dev(bio, sb->s_bdev);
+			bio->bi_bdev = sb->s_bdev;
 			bio->bi_iter.bi_sector = (sector_t)(first_index + i) <<
 				LOG_SECTORS_PER_BLOCK;
 			bio->bi_private = bi_private;
