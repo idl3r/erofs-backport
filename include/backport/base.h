@@ -98,4 +98,7 @@ static inline void *kvmalloc_array(size_t n, size_t size, gfp_t flags)
 	return kmalloc(bytes, flags);
 }
 
+extern int LZ4_decompress_safe_partial(const char *src, char *dst,
+	int compressedSize, int targetOutputSize, int dstCapacity);
+
 #endif
