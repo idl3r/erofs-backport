@@ -66,8 +66,10 @@ static struct inode *erofs_alloc_inode(struct super_block *sb)
 	return &vi->vfs_inode;
 }
 
-static void erofs_free_inode(struct inode *inode)
+static void erofs_inode_callback(struct rcu_head *head)
+// static void erofs_free_inode(struct inode *inode)
 {
+	struct inode *inode = container_of(head, struct inode, i_rcu);
 	struct erofs_inode *vi = EROFS_I(inode);
 
 	/* be careful of RCU symlink path */
@@ -76,6 +78,11 @@ static void erofs_free_inode(struct inode *inode)
 	kfree(vi->xattr_shared_xattrs);
 
 	kmem_cache_free(erofs_inode_cachep, vi);
+}
+
+static void erofs_destroy_inode(struct inode *inode)
+{
+	call_rcu(&inode->i_rcu, erofs_inode_callback);
 }
 
 static bool check_layout_compatibility(struct super_block *sb,
@@ -601,6 +608,7 @@ out:
 const struct super_operations erofs_sops = {
 	.put_super = erofs_put_super,
 	.alloc_inode = erofs_alloc_inode,
+	.destroy_inode = erofs_destroy_inode,
 	/*.free_inode = erofs_free_inode,*/
 	.statfs = erofs_statfs,
 	.show_options = erofs_show_options,
