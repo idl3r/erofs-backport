@@ -1,20 +1,31 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0
 /*
+ * linux/drivers/staging/erofs/data.c
+ *
  * Copyright (C) 2017-2018 HUAWEI, Inc.
  *             http://www.huawei.com/
  * Created by Gao Xiang <gaoxiang25@huawei.com>
+ *
+ * This file is subject to the terms and conditions of the GNU General Public
+ * License.  See the file COPYING in the main directory of the Linux
+ * distribution for more details.
  */
 #include "internal.h"
 #include <linux/prefetch.h>
 
 #include <trace/events/erofs.h>
 
-static void erofs_readendio(struct bio *bio)
+static inline void read_endio(struct bio *bio)
 {
+	struct super_block *const sb = bio->bi_private;
 	int i;
 	struct bio_vec *bvec;
 	blk_status_t err = bio->bi_status;
-	/* struct bvec_iter_all iter_all; */
+
+	if (time_to_inject(EROFS_SB(sb), FAULT_READ_IO)) {
+		erofs_show_injection_info(FAULT_READ_IO);
+		err = BLK_STS_IOERR;
+	}
 
 	bio_for_each_segment_all(bvec, bio, i) {
 		struct page *page = bvec->bv_page;
@@ -22,7 +33,7 @@ static void erofs_readendio(struct bio *bio)
 		/* page is already locked */
 		DBG_BUGON(PageUptodate(page));
 
-		if (err)
+		if (unlikely(err))
 			SetPageError(page);
 		else
 			SetPageUptodate(page);
@@ -33,17 +44,77 @@ static void erofs_readendio(struct bio *bio)
 	bio_put(bio);
 }
 
-struct page *erofs_get_meta_page(struct super_block *sb, erofs_blk_t blkaddr)
+/* prio -- true is used for dir */
+struct page *__erofs_get_meta_page(struct super_block *sb,
+				   erofs_blk_t blkaddr, bool prio, bool nofail)
 {
-	struct address_space *const mapping = sb->s_bdev->bd_inode->i_mapping;
+	struct inode *const bd_inode = sb->s_bdev->bd_inode;
+	struct address_space *const mapping = bd_inode->i_mapping;
+	/* prefer retrying in the allocator to blindly looping below */
+	const gfp_t gfp = mapping_gfp_constraint(mapping, ~__GFP_FS) |
+		(nofail ? __GFP_NOFAIL : 0);
+	unsigned int io_retries = nofail ? EROFS_IO_MAX_RETRIES_NOFAIL : 0;
 	struct page *page;
+	int err;
 
-	page = read_cache_page_gfp(mapping, blkaddr,
-				   mapping_gfp_constraint(mapping, ~__GFP_FS));
-	/* should already be PageUptodate */
-	if (!IS_ERR(page))
+repeat:
+	page = find_or_create_page(mapping, blkaddr, gfp);
+	if (unlikely(!page)) {
+		DBG_BUGON(nofail);
+		return ERR_PTR(-ENOMEM);
+	}
+	DBG_BUGON(!PageLocked(page));
+
+	if (!PageUptodate(page)) {
+		struct bio *bio;
+
+		bio = erofs_grab_bio(sb, blkaddr, 1, sb, read_endio, nofail);
+		if (IS_ERR(bio)) {
+			DBG_BUGON(nofail);
+			err = PTR_ERR(bio);
+			goto err_out;
+		}
+
+		err = bio_add_page(bio, page, PAGE_SIZE, 0);
+		if (unlikely(err != PAGE_SIZE)) {
+			err = -EFAULT;
+			goto err_out;
+		}
+
+#if defined(CONFIG_EROFS_FS_HUAWEI_EXTENSION) && defined(REQ_FG)
+		__submit_bio(bio, REQ_OP_READ,
+			     REQ_META | (prio ? REQ_PRIO | REQ_FG : 0));
+#else
+		__submit_bio(bio, REQ_OP_READ,
+			     REQ_META | (prio ? REQ_PRIO : 0));
+#endif
+
 		lock_page(page);
+
+		/* this page has been truncated by others */
+		if (unlikely(page->mapping != mapping)) {
+unlock_repeat:
+			unlock_page(page);
+			put_page(page);
+			goto repeat;
+		}
+
+		/* more likely a read error */
+		if (unlikely(!PageUptodate(page))) {
+			if (io_retries) {
+				--io_retries;
+				goto unlock_repeat;
+			}
+			err = -EIO;
+			goto err_out;
+		}
+	}
 	return page;
+
+err_out:
+	unlock_page(page);
+	put_page(page);
+	return ERR_PTR(err);
 }
 
 static int erofs_map_blocks_flatmode(struct inode *inode,
@@ -53,15 +124,14 @@ static int erofs_map_blocks_flatmode(struct inode *inode,
 	int err = 0;
 	erofs_blk_t nblocks, lastblk;
 	u64 offset = map->m_la;
-	struct erofs_inode *vi = EROFS_I(inode);
-	bool tailendpacking = (vi->datalayout == EROFS_INODE_FLAT_INLINE);
+	struct erofs_vnode *vi = EROFS_V(inode);
 
 	trace_erofs_map_blocks_flatmode_enter(inode, map, flags);
 
 	nblocks = DIV_ROUND_UP(inode->i_size, PAGE_SIZE);
-	lastblk = nblocks - tailendpacking;
+	lastblk = nblocks - is_inode_flat_inline(inode);
 
-	if (offset >= inode->i_size) {
+	if (unlikely(offset >= inode->i_size)) {
 		/* leave out-of-bound access unmapped */
 		map->m_flags = 0;
 		map->m_plen = 0;
@@ -74,7 +144,7 @@ static int erofs_map_blocks_flatmode(struct inode *inode,
 	if (offset < blknr_to_addr(lastblk)) {
 		map->m_pa = blknr_to_addr(vi->raw_blkaddr) + map->m_la;
 		map->m_plen = blknr_to_addr(lastblk) - offset;
-	} else if (tailendpacking) {
+	} else if (is_inode_flat_inline(inode)) {
 		/* 2 - inode inline B: inode, [xattrs], inline last blk... */
 		struct erofs_sb_info *sbi = EROFS_SB(inode->i_sb);
 
@@ -82,21 +152,17 @@ static int erofs_map_blocks_flatmode(struct inode *inode,
 			vi->xattr_isize + erofs_blkoff(map->m_la);
 		map->m_plen = inode->i_size - offset;
 
-		/* inline data should be located in one meta block */
+		/* inline data should locate in one meta block */
 		if (erofs_blkoff(map->m_pa) + map->m_plen > PAGE_SIZE) {
-			erofs_err(inode->i_sb,
-				  "inline data cross block boundary @ nid %llu",
-				  vi->nid);
 			DBG_BUGON(1);
-			err = -EFSCORRUPTED;
+			err = -EIO;
 			goto err_out;
 		}
 
 		map->m_flags |= EROFS_MAP_META;
 	} else {
-		erofs_err(inode->i_sb,
-			  "internal error @ nid: %llu (size %llu), m_la 0x%llx",
-			  vi->nid, inode->i_size, map->m_la);
+		errln("internal error @ nid: %llu (size %llu), m_la 0x%llx",
+		      vi->nid, inode->i_size, map->m_la);
 		DBG_BUGON(1);
 		err = -EIO;
 		goto err_out;
@@ -113,7 +179,7 @@ err_out:
 int erofs_map_blocks(struct inode *inode,
 		     struct erofs_map_blocks *map, int flags)
 {
-	if (erofs_inode_is_data_compressed(EROFS_I(inode)->datalayout)) {
+	if (unlikely(is_inode_layout_compression(inode))) {
 		int err = z_erofs_map_blocks_iter(inode, map, flags);
 
 		if (map->mpage) {
@@ -130,7 +196,8 @@ static inline struct bio *erofs_read_raw_page(struct bio *bio,
 					      struct page *page,
 					      erofs_off_t *last_block,
 					      unsigned int nblocks,
-					      bool ra)
+					      bool ra,
+					      unsigned int *io_submitted)
 {
 	struct inode *const inode = mapping->host;
 	struct super_block *const sb = inode->i_sb;
@@ -144,12 +211,18 @@ static inline struct bio *erofs_read_raw_page(struct bio *bio,
 		goto has_updated;
 	}
 
+	if (cleancache_get_page(page) == 0) {
+		err = 0;
+		SetPageUptodate(page);
+		goto has_updated;
+	}
+
 	/* note that for readpage case, bio also equals to NULL */
 	if (bio &&
 	    /* not continuous */
 	    *last_block + 1 != current_block) {
 submit_bio_retry:
-		submit_bio(bio);
+		__submit_bio(bio, REQ_OP_READ, 0);
 		bio = NULL;
 	}
 
@@ -161,11 +234,11 @@ submit_bio_retry:
 		unsigned int blkoff;
 
 		err = erofs_map_blocks(inode, &map, EROFS_GET_BLOCKS_RAW);
-		if (err)
+		if (unlikely(err))
 			goto err_out;
 
 		/* zero out the holed page */
-		if (!(map.m_flags & EROFS_MAP_MAPPED)) {
+		if (unlikely(!(map.m_flags & EROFS_MAP_MAPPED))) {
 			zero_user_segment(page, 0, PAGE_SIZE);
 			SetPageUptodate(page);
 
@@ -186,7 +259,7 @@ submit_bio_retry:
 
 			DBG_BUGON(map.m_plen > PAGE_SIZE);
 
-			ipage = erofs_get_meta_page(inode->i_sb, blknr);
+			ipage = erofs_get_meta_page(inode->i_sb, blknr, 0);
 
 			if (IS_ERR(ipage)) {
 				err = PTR_ERR(ipage);
@@ -219,13 +292,15 @@ submit_bio_retry:
 		if (nblocks > BIO_MAX_PAGES)
 			nblocks = BIO_MAX_PAGES;
 
-		bio = bio_alloc(GFP_NOIO, nblocks);
+		bio = erofs_grab_bio(sb, blknr, nblocks, sb,
+				     read_endio, false);
+		if (IS_ERR(bio)) {
+			err = PTR_ERR(bio);
+			bio = NULL;
+			goto err_out;
+		}
 
-		bio->bi_end_io = erofs_readendio;
-		bio_set_dev(bio, sb->s_bdev);
-		bio->bi_iter.bi_sector = (sector_t)blknr <<
-			LOG_SECTORS_PER_BLOCK;
-		bio->bi_opf = REQ_OP_READ;
+		++*io_submitted;
 	}
 
 	err = bio_add_page(bio, page, PAGE_SIZE, 0);
@@ -256,8 +331,9 @@ has_updated:
 	/* if updated manually, continuous pages has a gap */
 	if (bio)
 submit_bio_out:
-		submit_bio(bio);
-	return err ? ERR_PTR(err) : NULL;
+		__submit_bio(bio, REQ_OP_READ, 0);
+
+	return unlikely(err) ? ERR_PTR(err) : NULL;
 }
 
 /*
@@ -268,11 +344,12 @@ static int erofs_raw_access_readpage(struct file *file, struct page *page)
 {
 	erofs_off_t last_block;
 	struct bio *bio;
+	unsigned int io_submitted = 0;
 
 	trace_erofs_readpage(page, true);
 
 	bio = erofs_read_raw_page(NULL, page->mapping,
-				  page, &last_block, 1, false);
+				  page, &last_block, 1, false, &io_submitted);
 
 	if (IS_ERR(bio))
 		return PTR_ERR(bio);
@@ -290,8 +367,22 @@ static int erofs_raw_access_readpages(struct file *filp,
 	struct bio *bio = NULL;
 	gfp_t gfp = readahead_gfp_mask(mapping);
 	struct page *page = list_last_entry(pages, struct page, lru);
+	struct block_device *const bdev = mapping->host->i_sb->s_bdev;
+	unsigned int io_submitted = 0;
 
 	trace_erofs_readpages(mapping->host, page, nr_pages, true);
+
+#ifdef CONFIG_EROFS_FS_HUAWEI_EXTENSION
+	if (pages) {
+		/*
+		 * Get one quota before read pages, when this ends,
+		 * get the rest of quotas according to how many bios
+		 * we submited in this routine.
+		 */
+		// blk_throtl_get_quota(bdev, PAGE_SIZE,
+		// 		     msecs_to_jiffies(100), true);
+	}
+#endif
 
 	for (; nr_pages; --nr_pages) {
 		page = list_entry(pages->prev, struct page, lru);
@@ -301,13 +392,14 @@ static int erofs_raw_access_readpages(struct file *filp,
 
 		if (!add_to_page_cache_lru(page, mapping, page->index, gfp)) {
 			bio = erofs_read_raw_page(bio, mapping, page,
-						  &last_block, nr_pages, true);
+						  &last_block, nr_pages, true,
+						  &io_submitted);
 
 			/* all the page errors are ignored when readahead */
 			if (IS_ERR(bio)) {
 				pr_err("%s, readahead error at page %lu of nid %llu\n",
 				       __func__, page->index,
-				       EROFS_I(mapping->host)->nid);
+				       EROFS_V(mapping->host)->nid);
 
 				bio = NULL;
 			}
@@ -319,47 +411,20 @@ static int erofs_raw_access_readpages(struct file *filp,
 	DBG_BUGON(!list_empty(pages));
 
 	/* the rare case (end in gaps) */
-	if (bio)
-		submit_bio(bio);
+	if (unlikely(bio))
+		__submit_bio(bio, REQ_OP_READ, 0);
+
+#ifdef CONFIG_EROFS_FS_HUAWEI_EXTENSION
+	if (io_submitted)
+		while (--io_submitted)
+			// blk_throtl_get_quota(bdev, PAGE_SIZE,
+			// 		     msecs_to_jiffies(100), true);
+#endif
 	return 0;
-}
-
-static int erofs_get_block(struct inode *inode, sector_t iblock,
-			   struct buffer_head *bh, int create)
-{
-	struct erofs_map_blocks map = {
-		.m_la = iblock << 9,
-	};
-	int err;
-
-	err = erofs_map_blocks(inode, &map, EROFS_GET_BLOCKS_RAW);
-	if (err)
-		return err;
-
-	if (map.m_flags & EROFS_MAP_MAPPED)
-		bh->b_blocknr = erofs_blknr(map.m_pa);
-
-	return err;
-}
-
-static sector_t erofs_bmap(struct address_space *mapping, sector_t block)
-{
-	struct inode *inode = mapping->host;
-
-	if (EROFS_I(inode)->datalayout == EROFS_INODE_FLAT_INLINE) {
-		erofs_blk_t blks = i_size_read(inode) >> LOG_BLOCK_SIZE;
-
-		if (block >> LOG_SECTORS_PER_BLOCK >= blks)
-			return 0;
-	}
-
-	return generic_block_bmap(mapping, block, erofs_get_block);
 }
 
 /* for uncompressed (aligned) files and raw access for other files */
 const struct address_space_operations erofs_raw_access_aops = {
 	.readpage = erofs_raw_access_readpage,
 	.readpages = erofs_raw_access_readpages,
-	.bmap = erofs_bmap,
 };
-
